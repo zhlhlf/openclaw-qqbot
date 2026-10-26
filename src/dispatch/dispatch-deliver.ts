@@ -6,6 +6,7 @@
  * kind=final 与已发 block 去重；流占用时收尾后跳过静态文本。
  */
 import type { PluginLogger } from '../utils/plugin-logger.js';
+import { confirmOutboundSend, releaseOutboundSend, reserveOutboundSend } from './send-ledger.js';
 import { formatLogTextPreview } from '../utils/log-text-preview.js';
 import type {
   DeliverContext,
@@ -26,6 +27,8 @@ export type DispatchDeliverState = {
   deliveredMediaUrls: Set<string>;
   deliveredTexts: Set<string>;
   log?: PluginLogger;
+  /** 入站消息 id，用于跨派发的发送账本（防同一段文本被重复投递） */
+  inboundMessageId?: string;
   deliverReply: (
     payload: DeliverPayload,
     info: DeliverInfo | undefined,
@@ -35,6 +38,32 @@ export type DispatchDeliverState = {
 
 export function streamOwnsText(controller: StreamTextOwner | null): boolean {
   return Boolean(controller?.hasStarted && !controller.shouldFallbackToStatic);
+}
+
+/**
+ * 跨派发去重：同一入站消息的同一段文本只发一次。
+ * 返回 true 表示可以发；false 表示已经发过，调用方应直接 return。
+ */
+function claimText(state: DispatchDeliverState, text: string): boolean {
+  if (!text) return true;
+  const ok = reserveOutboundSend(state.ctx.accountId, state.inboundMessageId ?? state.ctx.replyToId, text);
+  if (!ok) {
+    state.log?.warn(
+      `send-ledger dropping duplicate delivery inbound=${state.inboundMessageId ?? state.ctx.replyToId ?? '-'} textLen=${text.length}`,
+    );
+  }
+  return ok;
+}
+
+/** 发送成功才保留这段文本的去重占位；失败立刻撤销，让重试还能再发一次。 */
+function confirmText(state: DispatchDeliverState, text: string): void {
+  if (!text) return;
+  confirmOutboundSend(state.ctx.accountId, state.inboundMessageId ?? state.ctx.replyToId, text);
+}
+
+function releaseText(state: DispatchDeliverState, text: string): void {
+  if (!text) return;
+  releaseOutboundSend(state.ctx.accountId, state.inboundMessageId ?? state.ctx.replyToId, text);
 }
 
 export async function deliverDispatchPayload(
@@ -65,7 +94,14 @@ export async function deliverDispatchPayload(
     if (streamOwnsText(state.streamingController) || !text || state.deliveredTexts.has(text)) {
       return;
     }
-    await sendReply({ text }, info, state.ctx);
+    if (!claimText(state, text)) return;
+    try {
+      await sendReply({ text }, info, state.ctx);
+    } catch (err) {
+      releaseText(state, text);
+      throw err;
+    }
+    confirmText(state, text);
     state.deliveredTexts.add(text);
     return;
   }
@@ -84,11 +120,20 @@ export async function deliverDispatchPayload(
     return;
   }
 
+  const claimsText = Boolean(text && !hasMedia && !payload.audioAsVoice);
+  if (claimsText && !claimText(state, text)) return;
+
   const filteredPayload = filterDeliveredMedia(payload, state.deliveredMediaUrls);
   const payloadToSend = text && state.deliveredTexts.has(text)
     ? { ...filteredPayload, text: undefined }
     : filteredPayload;
-  await sendReply(payloadToSend, info, state.ctx);
+  try {
+    await sendReply(payloadToSend, info, state.ctx);
+  } catch (err) {
+    if (claimsText) releaseText(state, text);
+    throw err;
+  }
+  if (claimsText) confirmText(state, text);
   if (text) state.deliveredTexts.add(text);
   for (const u of payloadToSend.mediaUrls ?? []) state.deliveredMediaUrls.add(u);
   if (payloadToSend.mediaUrl) state.deliveredMediaUrls.add(payloadToSend.mediaUrl);
